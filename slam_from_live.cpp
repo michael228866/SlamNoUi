@@ -40,27 +40,44 @@ map<int, MarkerPose> loadMap(const string& filename) {
 
     cv::FileNode markers = fs["aruco_bc_markers"];
     if (markers.type() != cv::FileNode::SEQ) {
-        cerr << "Invalid map format: missing 'aruco_bc_markers'.\n";
+        cerr << "地圖格式錯誤：缺少 'aruco_bc_markers'" << endl;
         return poses;
     }
+
+    float markerLength = 0.164f;
+    float half = markerLength / 2.0f;
+
+    vector<cv::Point3f> objPts = {
+        {-half,  half, 0},
+        { half,  half, 0},
+        { half, -half, 0},
+        {-half, -half, 0}
+    };
 
     for (const auto& m : markers) {
         MarkerPose mp;
         mp.id = (int)m["id"];
 
-        cv::FileNode corners = m["corners"];
-        if (corners.size() != 4) continue;
+        cv::FileNode cornersNode = m["corners"];
+        if (cornersNode.size() != 4) continue;
 
-        cv::Point3f center(0, 0, 0);
+        vector<cv::Point3f> realPts;
         for (int i = 0; i < 4; ++i) {
             cv::Vec3f pt;
-            corners[i] >> pt;
-            center += cv::Point3f(pt);
+            cornersNode[i] >> pt;
+            realPts.emplace_back(pt);
         }
 
-        center *= 0.25f;
-        mp.tvec = cv::Vec3d(center.x, center.y, center.z);
-        mp.rvec = cv::Vec3d(0, 0, 0);
+        cv::Mat affine;
+        cv::estimateAffine3D(objPts, realPts, affine, cv::noArray());
+
+        // 將 affine (3x4) 轉換為 R, t
+        cv::Mat R = affine(cv::Rect(0, 0, 3, 3)).clone(); // 3x3
+        cv::Mat t = affine(cv::Rect(3, 0, 1, 3)).clone(); // 3x1
+
+        cv::Rodrigues(R, mp.rvec);
+        mp.tvec = cv::Vec3d(t.at<double>(0), t.at<double>(1), t.at<double>(2));
+
         poses[mp.id] = mp;
     }
 
@@ -173,8 +190,8 @@ int main(int argc, char** argv) {
             double angle_rad = acos(dot_product);
             double angle_deg = angle_rad * 180.0 / CV_PI;
 
-            if (angle_deg>35){
-                cout << "角度" << angle_deg << " 超過35度所以，略過。\n";
+            if (angle_deg>60){
+                cout << "角度" << angle_deg << " 超過60度所以，略過。\n";
                 continue;
             }
 
