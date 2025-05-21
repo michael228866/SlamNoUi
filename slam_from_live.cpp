@@ -122,9 +122,11 @@ int main(int argc, char** argv) {
 			auto it = map.find(marker.id);
 			if (it == map.end()) {
 				cout << "⚠️ Marker ID " << marker.id << " 不在地圖中，略過。\n";
-				logFile << "⚠️ Marker ID " << marker.id << " 不在地圖中，略過。\n";
 				continue;
 			}
+
+
+
             cv::Mat rvec_marker, tvec_marker;
             cv::Rodrigues(cv::Mat(it->second.rvec), rvec_marker);
             tvec_marker = cv::Mat(it->second.tvec).clone();
@@ -150,6 +152,31 @@ int main(int argc, char** argv) {
             T_map_marker.at<double>(2, 3) = tvec_marker.at<double>(2);
 
             cv::Mat T_map_to_cam = T_map_marker * T_marker_to_cam;
+
+            // 相機位置（map座標系）
+            cv::Mat cam_pos = T_map_to_cam(cv::Rect(3, 0, 1, 3)).clone(); // 3x1
+
+            // marker 在地圖的位置（地圖座標）
+            cv::Mat marker_pos = cv::Mat(it->second.tvec).clone(); // 3x1
+
+            // 相機指向 marker 的向量（從相機指到 marker）
+            cv::Mat dir_to_marker = marker_pos - cam_pos;
+            dir_to_marker /= cv::norm(dir_to_marker);  // 單位化
+
+            // 相機的 Z 軸（forward）方向，在 map 中的表示：T_map_to_cam 的第3欄
+            cv::Mat cam_z = T_map_to_cam(cv::Rect(2, 0, 1, 3)).clone(); // 3x1
+            cam_z /= cv::norm(cam_z);  // 單位向量
+
+            // 計算夾角（rad 再轉 deg）
+            double dot_product = cam_z.dot(dir_to_marker);
+            dot_product = std::max(-1.0, std::min(1.0, dot_product));
+            double angle_rad = acos(dot_product);
+            double angle_deg = angle_rad * 180.0 / CV_PI;
+
+            if (angle_deg>35){
+                cout << "角度" << angle_deg << " 超過35度所以，略過。\n";
+                continue;
+            }
 
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             logFile << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
