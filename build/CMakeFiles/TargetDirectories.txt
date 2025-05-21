@@ -1,0 +1,3 @@
+/home/pi/SlamNoUi/build/CMakeFiles/slam_from_live.dir
+/home/pi/SlamNoUi/build/CMakeFiles/edit_cache.dir
+/home/pi/SlamNoUi/build/CMakeFiles/rebuild_cache.dir
