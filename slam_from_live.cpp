@@ -75,20 +75,25 @@ bool loadCameraParams(const string& filename, CameraParameters& camParams) {
     }
 }
 
-map<int, MarkerPose> loadMap(const string& filename,float markerSize) {
+#include <Eigen/Dense>
+using namespace Eigen;
+
+map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
     map<int, MarkerPose> poses;
     cv::FileStorage fs(filename, cv::FileStorage::READ);
-    if (!fs.isOpened()) return poses;
-
-    cv::FileNode markers = fs["aruco_bc_markers"];
-    if (markers.type() != cv::FileNode::SEQ) {
-        cerr << "地圖格式錯誤：缺少 'aruco_bc_markers'" << endl;
+    if (!fs.isOpened()) {
+        cerr << "❌ 無法開啟地圖檔案：" << filename << endl;
         return poses;
     }
 
-    float markerLength = markerSize;
-    float half = markerLength / 2.0f;
-    vector<cv::Point3f> objPts = {
+    cv::FileNode markers = fs["aruco_bc_markers"];
+    if (markers.empty() || !markers.isSeq()) {
+        cerr << "❌ 地圖格式錯誤：缺少 'aruco_bc_markers'" << endl;
+        return poses;
+    }
+
+    float half = markerSize / 2.0f;
+    vector<Vector3d> objPts = {
         {-half,  half, 0},
         { half,  half, 0},
         { half, -half, 0},
@@ -96,31 +101,66 @@ map<int, MarkerPose> loadMap(const string& filename,float markerSize) {
     };
 
     for (const auto& m : markers) {
-        MarkerPose mp;
-        mp.id = (int)m["id"];
+        int id = (int)m["id"];
         cv::FileNode cornersNode = m["corners"];
         if (cornersNode.size() != 4) continue;
 
-        vector<cv::Point3f> realPts;
+        vector<Vector3d> worldPts;
         for (int i = 0; i < 4; ++i) {
             cv::Vec3f pt;
             cornersNode[i] >> pt;
-            realPts.emplace_back(pt);
+            worldPts.emplace_back(pt[0], pt[1], pt[2]);
         }
 
-        cv::Mat affine;
-        cv::estimateAffine3D(objPts, realPts, affine, cv::noArray());
+        // 計算中心
+        Vector3d center_obj = Vector3d::Zero();
+        Vector3d center_world = Vector3d::Zero();
+        for (int i = 0; i < 4; ++i) {
+            center_obj += objPts[i];
+            center_world += worldPts[i];
+        }
+        center_obj /= 4.0;
+        center_world /= 4.0;
 
-        cv::Mat R = affine(cv::Rect(0, 0, 3, 3)).clone();
-        cv::Mat t = affine(cv::Rect(3, 0, 1, 3)).clone();
+        // 去中心化
+        MatrixXd X(3, 4), Y(3, 4);
+        for (int i = 0; i < 4; ++i) {
+            X.col(i) = objPts[i] - center_obj;
+            Y.col(i) = worldPts[i] - center_world;
+        }
 
-        cv::Rodrigues(R, mp.rvec);
-        mp.tvec = cv::Vec3d(t);
+        // SVD 求旋轉
+        Matrix3d H = X * Y.transpose();
+        JacobiSVD<Matrix3d> svd(H, ComputeFullU | ComputeFullV);
+        Matrix3d R = svd.matrixV() * svd.matrixU().transpose();
+
+        // 檢查是否翻轉（避免反射）
+        if (R.determinant() < 0) {
+            Matrix3d V = svd.matrixV();
+            V.col(2) *= -1;
+            R = V * svd.matrixU().transpose();
+        }
+
+        Vector3d t = center_world - R * center_obj;
+
+        // 儲存結果
+        MarkerPose mp;
+        mp.id = id;
+
+        // 轉為 OpenCV Vec3d
+        cv::Rodrigues((cv::Mat_<double>(3, 3) << 
+            R(0, 0), R(0, 1), R(0, 2),
+            R(1, 0), R(1, 1), R(1, 2),
+            R(2, 0), R(2, 1), R(2, 2)
+        ), mp.rvec);
+        mp.tvec = cv::Vec3d(t(0), t(1), t(2));
 
         poses[mp.id] = mp;
     }
+
     return poses;
 }
+
 
 int main(int argc, char** argv) {
     if (argc < 4) {
