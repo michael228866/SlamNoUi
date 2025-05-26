@@ -75,9 +75,6 @@ bool loadCameraParams(const string& filename, CameraParameters& camParams) {
     }
 }
 
-#include <Eigen/Dense>
-using namespace Eigen;
-
 map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
     map<int, MarkerPose> poses;
     cv::FileStorage fs(filename, cv::FileStorage::READ);
@@ -148,11 +145,11 @@ map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
         mp.id = id;
 
         // 轉為 OpenCV Vec3d
-        cv::Rodrigues((cv::Mat_<double>(3, 3) << 
+        cv::Mat R_cv = (cv::Mat_<double>(3, 3) <<
             R(0, 0), R(0, 1), R(0, 2),
             R(1, 0), R(1, 1), R(1, 2),
-            R(2, 0), R(2, 1), R(2, 2)
-        ), mp.rvec);
+            R(2, 0), R(2, 1), R(2, 2));
+        cv::Rodrigues(R_cv, mp.rvec);
         mp.tvec = cv::Vec3d(t(0), t(1), t(2));
 
         poses[mp.id] = mp;
@@ -160,7 +157,6 @@ map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
 
     return poses;
 }
-
 
 int main(int argc, char** argv) {
     if (argc < 4) {
@@ -184,7 +180,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    auto map = loadMap(mapPath, markerSize);
+    auto map = loadMap(mapPath,markerSize);
     if (map.empty()) {
         cerr << "Cannot load marker map from: " << mapPath << endl;
         return -1;
@@ -202,9 +198,7 @@ int main(int argc, char** argv) {
 
     MarkerDetector detector;
     detector.setDictionary("ARUCO_MIP_36h12");
-    aruco::MarkerDetector::Params& params = detector.getParameters();
-    params.cornerRefinementM = aruco::CORNER_SUBPIX; 
-    params.error_correction_rate = 0.6; 
+    detector.getParameters().setCornerRefinementMethod(aruco::CornerRefinementMethod::CORNER_SUBPIX);
 
     cv::Mat frame;
     while (true) {
@@ -215,7 +209,7 @@ int main(int argc, char** argv) {
         detector.detect(frame, detectedMarkers, camParams, markerSize);
 
         vector<cv::Mat> poses;
-
+        
         for (const auto& marker : detectedMarkers) {
             cout << "\033[1;34m✔ 偵測到 Marker ID:\033[0m " << marker.id << endl;
             logFile << "偵測到 Marker ID: " << marker.id << endl;
@@ -250,15 +244,14 @@ int main(int argc, char** argv) {
             T_map_marker.at<double>(1, 3) = tvec_marker.at<double>(1);
             T_map_marker.at<double>(2, 3) = tvec_marker.at<double>(2);
 
-            cv::Mat T_map_to_cam = T_marker_to_cam * T_map_marker.inv();  // 先反轉 marker->map 得到 map->marker
+            cv::Mat T_map_to_cam = T_map_marker * T_marker_to_cam;
             cv::Mat cam_pos = T_map_to_cam(cv::Rect(3, 0, 1, 3)).clone();
             cv::Mat marker_pos = cv::Mat(it->second.tvec).clone();
             cv::Mat dir_to_marker = marker_pos - cam_pos;
             dir_to_marker /= cv::norm(dir_to_marker);
 
-            cv::Mat R_map_to_cam = T_map_to_cam(cv::Rect(0, 0, 3, 3));
-            cv::Mat cam_z = R_map_to_cam.t() * (cv::Mat_<double>(3, 1) << 0, 0, 1);  // 相機Z軸在地圖座標下的方向
-            cam_z /= cv::norm(cam_z);            
+            cv::Mat cam_z = T_map_to_cam(cv::Rect(2, 0, 1, 3)).clone();
+            cam_z /= cv::norm(cam_z);
 
             double dot_product = cam_z.dot(dir_to_marker);
             dot_product = std::max(-1.0, std::min(1.0, dot_product));
@@ -269,7 +262,7 @@ int main(int argc, char** argv) {
                 cout << "角度" << angle_deg << " 超過60度所以，略過。\n";
                 continue;
             }
-            
+           
             vector<cv::Point2f> reprojected;
             cv::projectPoints(marker.get3DPoints(markerSize), marker.Rvec, marker.Tvec,
                             camParams.CameraMatrix, camParams.Distorsion, reprojected);
@@ -284,7 +277,6 @@ int main(int argc, char** argv) {
             } else {
                 cout << "✅ 標記 " << marker.id << " 重投影誤差: " << error << endl;
             }
-            
 
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             logFile << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
@@ -296,8 +288,7 @@ int main(int argc, char** argv) {
             vector<Quaterniond> quats;
 
             for (const auto& T : poses) {
-                cv::Mat T_inv = T.inv();  // camera -> map
-                avg_t += cv::Vec3d(T_inv.at<double>(0, 3), T_inv.at<double>(1, 3), T_inv.at<double>(2, 3));
+                avg_t += cv::Vec3d(T.at<double>(0, 3), T.at<double>(1, 3), T.at<double>(2, 3));
 
                 Matrix3d R;
                 for (int i = 0; i < 3; ++i)
@@ -327,12 +318,19 @@ int main(int argc, char** argv) {
             T_avg.at<double>(1, 3) = filtered_t[1];
             T_avg.at<double>(2, 3) = filtered_t[2];
 
-            cv::Mat R = T_avg(cv::Rect(0, 0, 3, 3));
-            cv::Mat R_cam_to_map = R.t();  // 相機 → 地圖
-            double dx = R_cam_to_map.at<double>(0, 2);
-            double dz = R_cam_to_map.at<double>(2, 2);
-            double yaw_rad = std::atan2(dx, dz);
-            double yaw_deg = yaw_rad * 180.0 / CV_PI;
+            // 提取相機姿態三軸方向（世界坐標中）
+            cv::Vec3d x_axis(T_avg.at<double>(0, 0), T_avg.at<double>(1, 0), T_avg.at<double>(2, 0));
+            cv::Vec3d y_axis(T_avg.at<double>(0, 1), T_avg.at<double>(1, 1), T_avg.at<double>(2, 1));
+            cv::Vec3d z_axis(T_avg.at<double>(0, 2), T_avg.at<double>(1, 2), T_avg.at<double>(2, 2));
+
+            x_axis /= cv::norm(x_axis);
+            y_axis /= cv::norm(y_axis);
+            z_axis /= cv::norm(z_axis);
+
+            cout << "🧭 X 軸方向 (右): " << x_axis << endl;
+            cout << "🧭 Y 軸方向 (上): " << y_axis << endl;
+            cout << "🧭 Z 軸方向 (前): " << z_axis << endl;
+
 
             cout << "\033[1;32m平均相機位置:\033[0m " << filtered_t << endl;
             cout << "平均相機姿態矩陣 (map -> camera):\n" << T_avg << endl;
@@ -346,10 +344,10 @@ int main(int argc, char** argv) {
             if (curl) {
                 std::stringstream json;
                 json << std::fixed << std::setprecision(6);
-                json << R"({"x": )" << filtered_t[0]
-                     << R"(, "y": )" << filtered_t[1]
-                     << R"(, "z": )" << filtered_t[2]
-                     << R"(, "yaw": )" << yaw_deg << "}";
+                json << R"({"type": "transform_report", "headsetId": "1", "pos": [)"
+                    << filtered_t[0] << ", " << filtered_t[1] << ", " << filtered_t[2]
+                    << R"(], "orient": [)"
+                    << z_axis[0] << ", " << z_axis[1] << ", " << z_axis[2] << "]}";
 
                 std::string json_str = json.str();
                 std::cout << "\U0001f4e4 Sent JSON: " << json_str << std::endl;
