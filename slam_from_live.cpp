@@ -75,21 +75,19 @@ bool loadCameraParams(const string& filename, CameraParameters& camParams) {
     }
 }
 
-map<int, MarkerPose> loadMap(const string& filename, float markerSize, const cv::Mat& camMatrix, const cv::Mat& distCoeffs) {
+map<int, MarkerPose> loadMap(const string& filename,float markerSize) {
     map<int, MarkerPose> poses;
     cv::FileStorage fs(filename, cv::FileStorage::READ);
-    if (!fs.isOpened()) {
-        cerr << "❌ 無法開啟地圖檔案：" << filename << endl;
-        return poses;
-    }
+    if (!fs.isOpened()) return poses;
 
     cv::FileNode markers = fs["aruco_bc_markers"];
-    if (markers.empty() || !markers.isSeq()) {
-        cerr << "❌ 地圖格式錯誤：缺少 'aruco_bc_markers'" << endl;
+    if (markers.type() != cv::FileNode::SEQ) {
+        cerr << "地圖格式錯誤：缺少 'aruco_bc_markers'" << endl;
         return poses;
     }
 
-    float half = markerSize / 2.0f;
+    float markerLength = markerSize;
+    float half = markerLength / 2.0f;
     vector<cv::Point3f> objPts = {
         {-half,  half, 0},
         { half,  half, 0},
@@ -98,24 +96,32 @@ map<int, MarkerPose> loadMap(const string& filename, float markerSize, const cv:
     };
 
     for (const auto& m : markers) {
-        int id = (int)m["id"];
+        MarkerPose mp;
+        mp.id = (int)m["id"];
         cv::FileNode cornersNode = m["corners"];
         if (cornersNode.size() != 4) continue;
 
-        vector<cv::Point2f> imagePts;
+        vector<cv::Point3f> realPts;
         for (int i = 0; i < 4; ++i) {
             cv::Vec3f pt;
             cornersNode[i] >> pt;
-            imagePts.emplace_back(pt[0], pt[1]); // 使用 x, y 當成 image point
+            realPts.emplace_back(pt);
         }
 
-        MarkerPose mp;
-        mp.id = id;
-        cv::solvePnP(objPts, imagePts, camMatrix, distCoeffs, mp.rvec, mp.tvec);
+        cv::Mat affine;
+        cv::estimateAffine3D(objPts, realPts, affine, cv::noArray());
+
+        cv::Mat R = affine(cv::Rect(0, 0, 3, 3)).clone();
+        cv::Mat t = affine(cv::Rect(3, 0, 1, 3)).clone();
+
+        cv::Rodrigues(R, mp.rvec);
+        mp.tvec = cv::Vec3d(t);
+
         poses[mp.id] = mp;
     }
     return poses;
 }
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         cout << "Usage: slam_from_live <map.yml> <camera.yml> <marker_size_m>" << endl;
@@ -138,7 +144,7 @@ int main(int argc, char** argv) {
         return -1;
     }
 
-    auto map = loadMap(mapPath, markerSize, camParams.CameraMatrix, camParams.Distorsion);
+    auto map = loadMap(mapPath, markerSize);
     if (map.empty()) {
         cerr << "Cannot load marker map from: " << mapPath << endl;
         return -1;
@@ -204,14 +210,15 @@ int main(int argc, char** argv) {
             T_map_marker.at<double>(1, 3) = tvec_marker.at<double>(1);
             T_map_marker.at<double>(2, 3) = tvec_marker.at<double>(2);
 
-            cv::Mat T_map_to_cam = T_map_marker * T_marker_to_cam;
+            cv::Mat T_map_to_cam = T_marker_to_cam * T_map_marker.inv();  // 先反轉 marker->map 得到 map->marker
             cv::Mat cam_pos = T_map_to_cam(cv::Rect(3, 0, 1, 3)).clone();
             cv::Mat marker_pos = cv::Mat(it->second.tvec).clone();
             cv::Mat dir_to_marker = marker_pos - cam_pos;
             dir_to_marker /= cv::norm(dir_to_marker);
 
-            cv::Mat cam_z = T_map_to_cam(cv::Rect(2, 0, 1, 3)).clone();
-            cam_z /= cv::norm(cam_z);
+            cv::Mat R_map_to_cam = T_map_to_cam(cv::Rect(0, 0, 3, 3));
+            cv::Mat cam_z = R_map_to_cam.t() * (cv::Mat_<double>(3, 1) << 0, 0, 1);  // 相機Z軸在地圖座標下的方向
+            cam_z /= cv::norm(cam_z);            
 
             double dot_product = cam_z.dot(dir_to_marker);
             dot_product = std::max(-1.0, std::min(1.0, dot_product));
@@ -249,7 +256,8 @@ int main(int argc, char** argv) {
             vector<Quaterniond> quats;
 
             for (const auto& T : poses) {
-                avg_t += cv::Vec3d(T.at<double>(0, 3), T.at<double>(1, 3), T.at<double>(2, 3));
+                cv::Mat T_inv = T.inv();  // camera -> map
+                avg_t += cv::Vec3d(T_inv.at<double>(0, 3), T_inv.at<double>(1, 3), T_inv.at<double>(2, 3));
 
                 Matrix3d R;
                 for (int i = 0; i < 3; ++i)
@@ -279,9 +287,10 @@ int main(int argc, char** argv) {
             T_avg.at<double>(1, 3) = filtered_t[1];
             T_avg.at<double>(2, 3) = filtered_t[2];
 
-            double dx = T_avg.at<double>(0, 2);
-            double dz = T_avg.at<double>(2, 2);
-
+            cv::Mat R = T_avg(cv::Rect(0, 0, 3, 3));
+            cv::Mat R_cam_to_map = R.t();  // 相機 → 地圖
+            double dx = R_cam_to_map.at<double>(0, 2);
+            double dz = R_cam_to_map.at<double>(2, 2);
             double yaw_rad = std::atan2(dx, dz);
             double yaw_deg = yaw_rad * 180.0 / CV_PI;
 
