@@ -53,8 +53,8 @@ public:
         for (int i = 0; i < 3; ++i)
             kf.measurementMatrix.at<double>(i, i) = 1.0;
 
-        cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-4));
-        cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-2));
+        cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-3));
+        cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1));
         cv::setIdentity(kf.errorCovPost, cv::Scalar::all(0.1));
     }
 
@@ -66,6 +66,13 @@ public:
         for (int i = 0; i < 3; ++i)
             state.at<double>(i) = kf.statePost.at<double>(i);
         return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
+    }
+
+    cv::Vec3d predictOnly() {
+    kf.predict();
+    for (int i = 0; i < 3; ++i)
+        state.at<double>(i) = kf.statePre.at<double>(i);
+    return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
     }
 };
 
@@ -161,43 +168,51 @@ map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
     return poses;
 }
 
+const int SLIDING_WINDOW = 5;
+std::deque<cv::Vec3d> recent_positions;
+
+
 int main(int argc, char** argv) {
+
+   cout << "🚀 程式啟動" << endl;
+
     if (argc < 4) {
-        cout << "Usage: slam_from_live <map.yml> <camera.yml> <marker_size_m>" << endl;
+        cout << "❗ 參數不足" << endl;
         return -1;
     }
 
+    cout << "📁 載入參數..." << endl;
     string mapPath = argv[1];
     string camPath = argv[2];
     float markerSize = stof(argv[3]);
 
-    ofstream logFile("pose_log.txt", ios::app);
-    if (!logFile.is_open()) {
-        cerr << "❌ 無法打開 pose_log.txt 進行寫入" << endl;
-        return -1;
-    }
-
+    cout << "📷 嘗試載入相機參數..." << endl;
     CameraParameters camParams;
     if (!loadCameraParams(camPath, camParams)) {
-        cerr << "Cannot load camera parameters from: " << camPath << endl;
+        cerr << "❌ 相機參數讀取失敗：" << camPath << endl;
         return -1;
     }
+    cout << "✅ 相機參數讀取成功" << endl;
 
-    auto map = loadMap(mapPath,markerSize);
+    cout << "🗺️ 嘗試載入 marker map..." << endl;
+    auto map = loadMap(mapPath, markerSize);
     if (map.empty()) {
-        cerr << "Cannot load marker map from: " << mapPath << endl;
+        cerr << "❌ 地圖讀取失敗：" << mapPath << endl;
         return -1;
     }
+    cout << "✅ 地圖載入完成，共有 " << map.size() << " 個 marker" << endl;
 
+    cout << "📷 嘗試開啟攝影機..." << endl;
     cv::VideoCapture cap("libcamerasrc ! videoconvert ! appsink", cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
-        cerr << "❌ 無法開啟攝影機（libcamerasrc）" << endl;
+        cerr << "❌ 攝影機打不開（GStreamer pipeline）" << endl;
         return -1;
     }
+    cout << "✅ 攝影機開啟成功" << endl;
 
 
     // 設定 WebSocket URL
-    websocket.setUrl("ws://192.168.3.29:5000");
+    websocket.setUrl("ws://192.168.9.96:5000?type=vr_headset&clientId=vr001");
 
     // 設定訊息接收 callback（這是你需要的最基本功能）
     websocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg) {
@@ -215,16 +230,15 @@ int main(int argc, char** argv) {
     websocket.start();
 
     double fps = cap.get(cv::CAP_PROP_FPS);
-    cout << "🎥 擷取到的攝影機 FPS: " << fps << endl;
-    KalmanFilter3D kalman_filter(1.0 / fps);
+    KalmanFilter3D kalman_filter(1.0 / fps );
 
     MarkerDetector detector;
     detector.setDictionary("ARUCO_MIP_36h12");
     detector.getParameters().setCornerRefinementMethod(aruco::CornerRefinementMethod::CORNER_SUBPIX);
-
+    detector.getParameters().cornerRefinementWinSize = 5;
+    detector.getParameters().cornerRefinementMaxIterations = 30;
     cv::Mat frame;
     while (true) {
-        cout << "攝影機 FPS: " << fps << endl;
         cap >> frame;
         if (frame.empty()) break;
 
@@ -235,7 +249,6 @@ int main(int argc, char** argv) {
         
         for (const auto& marker : detectedMarkers) {
             cout << "\033[1;34m✔ 偵測到 Marker ID:\033[0m " << marker.id << endl;
-            logFile << "偵測到 Marker ID: " << marker.id << endl;
 
             auto it = map.find(marker.id);
             if (it == map.end()) {
@@ -281,7 +294,7 @@ int main(int argc, char** argv) {
             double angle_rad = acos(dot_product);
             double angle_deg = angle_rad * 180.0 / CV_PI;
 
-            if (angle_deg > 60) {
+            if (angle_deg > 50) {
                 cout << "角度" << angle_deg << " 超過60度所以，略過。\n";
                 continue;
             }
@@ -302,7 +315,6 @@ int main(int argc, char** argv) {
             }
 
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
-            logFile << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             poses.push_back(T_map_to_cam);
         }
 
@@ -324,7 +336,25 @@ int main(int argc, char** argv) {
             }
             avg_t *= (1.0 / poses.size());
 
-            cv::Vec3d filtered_t = kalman_filter.update(avg_t);
+            // ➤ 加入進滑動視窗
+            recent_positions.push_back(avg_t);
+            if (recent_positions.size() > SLIDING_WINDOW)
+                recent_positions.pop_front();
+
+            // ➤ 計算滑動平均
+            cv::Vec3d smooth_t(0, 0, 0);
+            int N = recent_positions.size();
+            double total_weight = 0.0;
+
+            for (int i = 0; i < N; ++i) {
+                double weight = (i + 1);  // 權重線性成長：1, 2, ..., N
+                total_weight += weight;
+                smooth_t += recent_positions[i] * weight;
+            }
+            smooth_t *= (1.0 / total_weight);
+
+            // ➤ 再進 Kalman 濾波
+            cv::Vec3d filtered_t = kalman_filter.update(smooth_t);
 
             Quaterniond q_avg(0, 0, 0, 0);
             for (const auto& q : quats)
@@ -358,10 +388,6 @@ int main(int argc, char** argv) {
             cout << "\033[1;32m平均相機位置:\033[0m " << filtered_t << endl;
             cout << "平均相機姿態矩陣 (map -> camera):\n" << T_avg << endl;
 
-            logFile << "濾波後相機位置: [" << filtered_t[0] << ", " << filtered_t[1] << ", " << filtered_t[2] << "]\n";
-            logFile << "平均相機姿態矩陣 (map -> camera):\n" << T_avg << endl;
-            std::time_t now_c = std::time(nullptr);
-            logFile << "現在時間: " << std::ctime(&now_c) << endl;
 
             std::stringstream json;
             json << std::fixed << std::setprecision(6);
@@ -375,10 +401,12 @@ int main(int argc, char** argv) {
 
             websocket.send(json_str);
             
+        }else {
+            // 沒有偵測到 marker，也做 Kalman 預測
+            // cv::Vec3d filtered_t = kalman_filter.predictOnly();
         }
     }
 
-    logFile.close();
     return 0;
 
 
