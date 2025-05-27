@@ -12,8 +12,11 @@
 #include <fstream>
 #include <map>
 #include <ctime>
-#include <curl/curl.h>
 #include <iomanip>
+#include <ixwebsocket/IXWebSocket.h>
+
+ix::WebSocket websocket;
+
 
 using namespace std;
 using namespace aruco;
@@ -192,8 +195,27 @@ int main(int argc, char** argv) {
         return -1;
     }
 
+
+    // 設定 WebSocket URL
+    websocket.setUrl("ws://192.168.3.29:5000");
+
+    // 設定訊息接收 callback（這是你需要的最基本功能）
+    websocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg) {
+        if (msg->type == ix::WebSocketMessageType::Message) {
+            std::cout << "📩 收到訊息：" << msg->str << std::endl;
+        } else if (msg->type == ix::WebSocketMessageType::Open) {
+            std::cout << "✅ WebSocket 已連線" << std::endl;
+        } else if (msg->type == ix::WebSocketMessageType::Error) {
+            std::cerr << "❌ WebSocket 錯誤：" << msg->errorInfo.reason << std::endl;
+        } else if (msg->type == ix::WebSocketMessageType::Close) {
+            std::cout << "❌ WebSocket 關閉，原因: " << msg->closeInfo.reason << std::endl;
+        }
+    });
+
+    websocket.start();
+
     double fps = cap.get(cv::CAP_PROP_FPS);
-    if (fps <= 0 || fps > 120) fps = 30.0;
+    cout << "🎥 擷取到的攝影機 FPS: " << fps << endl;
     KalmanFilter3D kalman_filter(1.0 / fps);
 
     MarkerDetector detector;
@@ -202,6 +224,7 @@ int main(int argc, char** argv) {
 
     cv::Mat frame;
     while (true) {
+        cout << "攝影機 FPS: " << fps << endl;
         cap >> frame;
         if (frame.empty()) break;
 
@@ -271,7 +294,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < 4; ++i) {
                 error += cv::norm(marker[i] - reprojected[i]);
             }
-            if (error > 2.0) {
+            if (error > 4.0) {
                 cerr << "❌ 標記 " << marker.id << " 重投影誤差過大: " << error << endl;
                 continue;
             } else {
@@ -340,40 +363,23 @@ int main(int argc, char** argv) {
             std::time_t now_c = std::time(nullptr);
             logFile << "現在時間: " << std::ctime(&now_c) << endl;
 
-            CURL* curl = curl_easy_init();
-            if (curl) {
-                std::stringstream json;
-                json << std::fixed << std::setprecision(6);
-                json << R"({"type": "transform_report", "headsetId": "1", "pos": [)"
-                    << filtered_t[0] << ", " << filtered_t[1] << ", " << filtered_t[2]
-                    << R"(], "orient": [)"
-                    << z_axis[0] << ", " << z_axis[1] << ", " << z_axis[2] << "]}";
+            std::stringstream json;
+            json << std::fixed << std::setprecision(6);
+            json << R"({"type": "transform_update", "headsetId": "1", "pos": [)"
+                << filtered_t[0] << ", " << filtered_t[1] << ", " << filtered_t[2]
+                << R"(], "orient": [)"
+                << z_axis[0] << ", " << z_axis[1] << ", " << z_axis[2] << "]}";
 
-                std::string json_str = json.str();
-                std::cout << "\U0001f4e4 Sent JSON: " << json_str << std::endl;
+            std::string json_str = json.str();
+            std::cout << "📤 Sent JSON: " << json_str << std::endl;
 
-                struct curl_slist* headers = nullptr;
-                headers = curl_slist_append(headers, "Content-Type: application/json");
-
-                curl_easy_setopt(curl, CURLOPT_URL, "http://192.168.9.96:5000/position");
-                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str.c_str());
-                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, json_str.length());
-                curl_easy_setopt(curl, CURLOPT_POST, 1L);
-
-                CURLcode res = curl_easy_perform(curl);
-                if (res != CURLE_OK) {
-                    std::cerr << "❌ Failed to send: " << curl_easy_strerror(res) << std::endl;
-                } else {
-                    std::cout << "✅ Position sent to server.\n";
-                }
-
-                curl_slist_free_all(headers);
-                curl_easy_cleanup(curl);
-            }
+            websocket.send(json_str);
+            
         }
     }
 
     logFile.close();
     return 0;
+
+
 }
