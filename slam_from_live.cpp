@@ -28,53 +28,53 @@ struct MarkerPose {
     cv::Vec3d rvec;
 };
 
-class KalmanFilter3D {
-private:
-    cv::KalmanFilter kf;
-    cv::Mat state;
-    cv::Mat meas;
-    double dt;
+// class KalmanFilter3D {
+// private:
+//     cv::KalmanFilter kf;
+//     cv::Mat state;
+//     cv::Mat meas;
+//     double dt;
 
-public:
-    KalmanFilter3D(double dt = 1.0 / 30.0) : dt(dt) {
-        kf.init(6, 3, 0, CV_64F);
-        state = cv::Mat::zeros(6, 1, CV_64F);
-        meas = cv::Mat::zeros(3, 1, CV_64F);
+// public:
+//     KalmanFilter3D(double dt = 1.0 / 30.0) : dt(dt) {
+//         kf.init(6, 3, 0, CV_64F);
+//         state = cv::Mat::zeros(6, 1, CV_64F);
+//         meas = cv::Mat::zeros(3, 1, CV_64F);
 
-        kf.transitionMatrix = (cv::Mat_<double>(6, 6) <<
-            1, 0, 0, dt, 0, 0,
-            0, 1, 0, 0, dt, 0,
-            0, 0, 1, 0, 0, dt,
-            0, 0, 0, 1, 0, 0,
-            0, 0, 0, 0, 1, 0,
-            0, 0, 0, 0, 0, 1);
+//         kf.transitionMatrix = (cv::Mat_<double>(6, 6) <<
+//             1, 0, 0, dt, 0, 0,
+//             0, 1, 0, 0, dt, 0,
+//             0, 0, 1, 0, 0, dt,
+//             0, 0, 0, 1, 0, 0,
+//             0, 0, 0, 0, 1, 0,
+//             0, 0, 0, 0, 0, 1);
 
-        kf.measurementMatrix = cv::Mat::zeros(3, 6, CV_64F);
-        for (int i = 0; i < 3; ++i)
-            kf.measurementMatrix.at<double>(i, i) = 1.0;
+//         kf.measurementMatrix = cv::Mat::zeros(3, 6, CV_64F);
+//         for (int i = 0; i < 3; ++i)
+//             kf.measurementMatrix.at<double>(i, i) = 1.0;
 
-        cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-3));
-        cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1));
-        cv::setIdentity(kf.errorCovPost, cv::Scalar::all(0.1));
-    }
+//         cv::setIdentity(kf.processNoiseCov, cv::Scalar::all(1e-3));
+//         cv::setIdentity(kf.measurementNoiseCov, cv::Scalar::all(1e-1));
+//         cv::setIdentity(kf.errorCovPost, cv::Scalar::all(0.1));
+//     }
 
-    cv::Vec3d update(const cv::Vec3d& measurement) {
-        kf.predict();
-        for (int i = 0; i < 3; ++i)
-            meas.at<double>(i) = measurement[i];
-        kf.correct(meas);
-        for (int i = 0; i < 3; ++i)
-            state.at<double>(i) = kf.statePost.at<double>(i);
-        return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
-    }
+//     cv::Vec3d update(const cv::Vec3d& measurement) {
+//         kf.predict();
+//         for (int i = 0; i < 3; ++i)
+//             meas.at<double>(i) = measurement[i];
+//         kf.correct(meas);
+//         for (int i = 0; i < 3; ++i)
+//             state.at<double>(i) = kf.statePost.at<double>(i);
+//         return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
+//     }
 
-    cv::Vec3d predictOnly() {
-    kf.predict();
-    for (int i = 0; i < 3; ++i)
-        state.at<double>(i) = kf.statePre.at<double>(i);
-    return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
-    }
-};
+//     cv::Vec3d predictOnly() {
+//     kf.predict();
+//     for (int i = 0; i < 3; ++i)
+//         state.at<double>(i) = kf.statePre.at<double>(i);
+//     return cv::Vec3d(state.at<double>(0), state.at<double>(1), state.at<double>(2));
+//     }
+// };
 
 bool loadCameraParams(const string& filename, CameraParameters& camParams) {
     try {
@@ -171,6 +171,25 @@ map<int, MarkerPose> loadMap(const string& filename, float markerSize) {
 const int SLIDING_WINDOW = 5;
 std::deque<cv::Vec3d> recent_positions;
 
+//可信度
+double calculateConfidence(double reprojection_error, double angle_deg, double distance,float markerSize) {
+    // 設定權重與限制
+    const double max_error = 4.0;      // 誤差上限
+    const double max_angle = 60.0;     // 角度上限（越小越好）
+    double scale_factor = 12.0;
+
+    const double max_distance = markerSize*scale_factor;   // 距離上限（依場景調整）
+
+    // 各項評分 (0~1)，越接近 1 越好
+    double score_err = std::max(0.0, 1.0 - (reprojection_error / max_error));
+    double score_angle = std::max(0.0, 1.0 - (angle_deg / max_angle));
+    double score_dist = std::max(0.0, 1.0 - (distance / max_distance));
+
+    // 加權平均 (可調整比重)
+    double confidence = (score_err * 0.4) + (score_angle * 0.4) + (score_dist * 0.2);
+    return confidence;
+}
+
 
 int main(int argc, char** argv) {
 
@@ -229,14 +248,13 @@ int main(int argc, char** argv) {
 
     websocket.start();
 
-    double fps = cap.get(cv::CAP_PROP_FPS);
-    KalmanFilter3D kalman_filter(1.0 / fps );
+    // double fps = cap.get(cv::CAP_PROP_FPS);
+    // KalmanFilter3D kalman_filter(1.0 / fps );
 
     MarkerDetector detector;
     detector.setDictionary("ARUCO_MIP_36h12");
     detector.getParameters().setCornerRefinementMethod(aruco::CornerRefinementMethod::CORNER_SUBPIX);
-    detector.getParameters().cornerRefinementWinSize = 5;
-    detector.getParameters().cornerRefinementMaxIterations = 30;
+
     cv::Mat frame;
     while (true) {
         cap >> frame;
@@ -314,9 +332,22 @@ int main(int argc, char** argv) {
                 cout << "✅ 標記 " << marker.id << " 重投影誤差: " << error << endl;
             }
 
+            double distance = cv::norm(marker.Tvec);
+            double confidence = calculateConfidence(error, angle_deg, distance,markerSize);
+            cout << "🔍 信心值 (Confidence): " << confidence << endl;
+
+            // 可選：加入信心值過低則跳過
+            if (confidence < 0.5) {
+                cout << "⚠️ 可信度太低 (" << confidence << ")，略過此 marker。\n";
+                continue;
+            }
+
+
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             poses.push_back(T_map_to_cam);
         }
+
+
 
         if (!poses.empty()) {
             cv::Vec3d avg_t(0, 0, 0);
@@ -354,8 +385,11 @@ int main(int argc, char** argv) {
             smooth_t *= (1.0 / total_weight);
 
             // ➤ 再進 Kalman 濾波
-            cv::Vec3d filtered_t = kalman_filter.update(smooth_t);
+            // cv::Vec3d filtered_t = kalman_filter.update(smooth_t);
 
+            cv::Vec3d filtered_t = smooth_t;
+
+            
             Quaterniond q_avg(0, 0, 0, 0);
             for (const auto& q : quats)
                 q_avg.coeffs() += q.coeffs();
