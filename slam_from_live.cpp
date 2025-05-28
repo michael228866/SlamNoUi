@@ -265,6 +265,9 @@ int main(int argc, char** argv) {
 
         vector<cv::Mat> poses;
         
+        vector<double> confidences;
+
+        
         for (const auto& marker : detectedMarkers) {
             cout << "\033[1;34m✔ 偵測到 Marker ID:\033[0m " << marker.id << endl;
 
@@ -345,37 +348,61 @@ int main(int argc, char** argv) {
 
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             poses.push_back(T_map_to_cam);
+            confidences.push_back(confidence);            
         }
 
 
 
         if (!poses.empty()) {
-            cv::Vec3d avg_t(0, 0, 0);
+            cv::Vec3d weighted_t(0, 0, 0);
+            double total_weight = 0.0;
             vector<Quaterniond> quats;
 
-            for (const auto& T : poses) {
-                avg_t += cv::Vec3d(T.at<double>(0, 3), T.at<double>(1, 3), T.at<double>(2, 3));
+            for (size_t i = 0; i < poses.size(); ++i) {
+                double w = confidences[i];
+                total_weight += w;
+
+                weighted_t += w * cv::Vec3d(
+                    poses[i].at<double>(0, 3),
+                    poses[i].at<double>(1, 3),
+                    poses[i].at<double>(2, 3)
+                );
 
                 Matrix3d R;
-                for (int i = 0; i < 3; ++i)
-                    for (int j = 0; j < 3; ++j)
-                        R(i, j) = T.at<double>(i, j);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 3; ++c)
+                        R(r, c) = poses[i].at<double>(r, c);
 
                 Quaterniond q(R);
                 if (q.w() < 0) q.coeffs() *= -1;
-                quats.push_back(q);
+                Eigen::Quaterniond weighted_q(q.coeffs() * w);
+                quats.push_back(weighted_q);                
             }
-            avg_t *= (1.0 / poses.size());
+            if (total_weight > 0)
+                weighted_t *= (1.0 / total_weight);
+            else
+                weighted_t = cv::Vec3d(0, 0, 0); // fallback
 
+            // 使用 Markley method 將四元數做穩定加權平均
+            Eigen::Matrix4d A = Eigen::Matrix4d::Zero();
+            for (size_t i = 0; i < quats.size(); ++i) {
+                Eigen::Vector4d qv = quats[i].coeffs(); // 順序為 (x, y, z, w)
+                A += confidences[i] * (qv * qv.transpose());  // 加權外積
+            }
+
+            // Eigen 分解找最大特徵值
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> eig(A);
+            Eigen::Vector4d q_avg_vec = eig.eigenvectors().col(3);  // 取最大特徵值對應的 eigenvector
+            Eigen::Quaterniond q_avg(q_avg_vec[3], q_avg_vec[0], q_avg_vec[1], q_avg_vec[2]); // 轉回 Quaternion (w, x, y, z)
+            q_avg.normalize();
             // ➤ 加入進滑動視窗
-            recent_positions.push_back(avg_t);
+            recent_positions.push_back(weighted_t);
             if (recent_positions.size() > SLIDING_WINDOW)
                 recent_positions.pop_front();
 
             // ➤ 計算滑動平均
             cv::Vec3d smooth_t(0, 0, 0);
             int N = recent_positions.size();
-            double total_weight = 0.0;
 
             for (int i = 0; i < N; ++i) {
                 double weight = (i + 1);  // 權重線性成長：1, 2, ..., N
@@ -390,7 +417,6 @@ int main(int argc, char** argv) {
             cv::Vec3d filtered_t = smooth_t;
 
             
-            Quaterniond q_avg(0, 0, 0, 0);
             for (const auto& q : quats)
                 q_avg.coeffs() += q.coeffs();
             q_avg.normalize();
