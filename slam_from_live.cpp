@@ -1,6 +1,7 @@
 #include "marker.h"
 #include "markerdetector.h"
 #include "cameraparameters.h"
+#include "websocket_client.hpp"
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core/core.hpp>
@@ -14,16 +15,6 @@
 #include <ctime>
 #include <iomanip>
 
-#include <websocketpp/config/asio_no_tls_client.hpp>
-#include <websocketpp/client.hpp>
-#include <iostream>
-#include <string>
-#include <functional>
-
-typedef websocketpp::client<websocketpp::config::asio_client> ws_client;
-ws_client client;
-websocketpp::connection_hdl global_hdl;
-bool is_connected = false;
 
 using namespace std;
 using namespace aruco;
@@ -34,24 +25,6 @@ struct MarkerPose {
     cv::Vec3d tvec;
     cv::Vec3d rvec;
 };
-
-void on_message(websocketpp::connection_hdl, ws_client::message_ptr msg) {
-    std::cout << "📩 收到訊息：" << msg->get_payload() << std::endl;
-}
-
-void on_open(ws_client* c, websocketpp::connection_hdl hdl) {
-    std::cout << "✅ WebSocket 已連線" << std::endl;
-    global_hdl = hdl;
-    is_connected = true; // ⭐ 加上這行！
-}
-
-void on_close(ws_client* c, websocketpp::connection_hdl hdl) {
-    std::cout << "❌ WebSocket 關閉" << std::endl;
-}
-
-void on_fail(ws_client* c, websocketpp::connection_hdl hdl) {
-    std::cout << "❌ WebSocket 連線失敗" << std::endl;
-}
 
 
 // class KalmanFilter3D {
@@ -259,29 +232,10 @@ int main(int argc, char** argv) {
     cout << "✅ 攝影機開啟成功" << endl;
 
 
-    // 設定 WebSocket URL
-    std::string uri = "ws://192.168.3.29:5000/?clientType=vr_headset&clientId=vr00";
+    // WebSocket 初始化
+    WebSocketClient ws;
+    ws.connect("ws://192.168.3.29:5000/?clientType=vr_headset&clientId=vr001");
 
-    client.init_asio();
-    client.set_message_handler(&on_message);
-    client.set_open_handler(std::bind(&on_open, &client, std::placeholders::_1));
-    client.set_close_handler(std::bind(&on_close, &client, std::placeholders::_1));
-    client.set_fail_handler(std::bind(&on_fail, &client, std::placeholders::_1));
-
-    websocketpp::lib::error_code ec;
-    ws_client::connection_ptr con = client.get_connection(uri, ec);
-    if (ec) {
-        std::cout << "連線錯誤: " << ec.message() << std::endl;
-        return 1;
-    }
-    client.connect(con);
-
-    // 啟動事件循環（阻塞執行，直到連線關閉）
-    std::thread ws_thread([&client]() {
-        client.run();
-    });
-    // double fps = cap.get(cv::CAP_PROP_FPS);
-    // KalmanFilter3D kalman_filter(1.0 / fps );
 
     MarkerDetector detector;
     detector.setDictionary("ARUCO_MIP_36h12");
@@ -516,22 +470,16 @@ int main(int argc, char** argv) {
             std::string json_str = json.str();
             std::cout << "📤 Sent JSON: " << json_str << std::endl;
 
-            if (is_connected) {
-                websocketpp::lib::error_code ec_close;
-                client.close(global_hdl, websocketpp::close::status::normal, "結束傳送", ec_close);
-                if (ec_close) {
-                    std::cerr << "❌ 關閉 WebSocket 失敗: " << ec_close.message() << std::endl;
-                } else {
-                    std::cout << "🔚 WebSocket 已關閉" << std::endl;
-                }
-            }      
+            ws.send(json.str());
+    
         }else {
             // 沒有偵測到 marker，也做 Kalman 預測
             // cv::Vec3d filtered_t = kalman_filter.predictOnly();
         }
     }
 
-    ws_thread.join(); // 等待背景 WebSocket thread 正常結束（optional）
+    ws.close();
+
 
     return 0;
 
