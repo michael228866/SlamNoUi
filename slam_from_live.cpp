@@ -190,6 +190,9 @@ double calculateConfidence(double reprojection_error, double angle_deg, double d
     return confidence;
 }
 
+static Eigen::Quaterniond q_prev(1, 0, 0, 0);
+static Eigen::Vector3d pos_prev(0, 0, 0);
+double alpha = 0.1;
 
 int main(int argc, char** argv) {
 
@@ -231,8 +234,10 @@ int main(int argc, char** argv) {
 
 
     // 設定 WebSocket URL
-    websocket.setUrl("ws://192.168.9.96:5000?type=vr_headset&clientId=vr001");
+    websocket.setUrl("ws://192.168.3.29:5000?clientType=vr_headset&clientId=vr00");
 
+
+    
     // 設定訊息接收 callback（這是你需要的最基本功能）
     websocket.setOnMessageCallback([](const ix::WebSocketMessagePtr& msg) {
         if (msg->type == ix::WebSocketMessageType::Message) {
@@ -245,6 +250,9 @@ int main(int argc, char** argv) {
             std::cout << "❌ WebSocket 關閉，原因: " << msg->closeInfo.reason << std::endl;
         }
     });
+
+    std::cout << "🌐 實際連線的 WebSocket URL：" << websocket.getUrl() << std::endl;
+
 
     websocket.start();
 
@@ -328,7 +336,7 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < 4; ++i) {
                 error += cv::norm(marker[i] - reprojected[i]);
             }
-            if (error > 4.0) {
+            if (error > 1.0) {
                 cerr << "❌ 標記 " << marker.id << " 重投影誤差過大: " << error << endl;
                 continue;
             } else {
@@ -346,17 +354,59 @@ int main(int argc, char** argv) {
             }
 
 
+            
             cout << "Estimated camera pose (map -> camera):\n" << T_map_to_cam << endl;
             poses.push_back(T_map_to_cam);
             confidences.push_back(confidence);            
         }
 
 
+        // 1️⃣ 按信心值排序，保留前 K 個
+        vector<std::pair<double, cv::Mat>> pose_conf_pairs;
+        for (size_t i = 0; i < poses.size(); ++i) {
+            pose_conf_pairs.emplace_back(confidences[i], poses[i]);
+        }
+        std::sort(pose_conf_pairs.begin(), pose_conf_pairs.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        int K = 3; // 可調整 2~4
+        pose_conf_pairs.resize(std::min(K, (int)pose_conf_pairs.size()));
+
+        poses.clear();
+        confidences.clear();
+        for (const auto& p : pose_conf_pairs) {
+            confidences.push_back(p.first);
+            poses.push_back(p.second);
+        }
+
+        // 2️⃣ 空間一致性驗證（丟掉離群 pose）
+        cv::Vec3d mean_t(0, 0, 0);
+        for (const auto& p : poses) {
+            mean_t += cv::Vec3d(p.at<double>(0, 3), p.at<double>(1, 3), p.at<double>(2, 3));
+        }
+        mean_t *= (1.0 / poses.size());
+
+        vector<cv::Mat> filtered_poses;
+        vector<double> filtered_confidences;
+        for (size_t i = 0; i < poses.size(); ++i) {
+            cv::Vec3d t(poses[i].at<double>(0, 3), poses[i].at<double>(1, 3), poses[i].at<double>(2, 3));
+            double dist = cv::norm(t - mean_t);
+            if (dist < 0.3) { // 根據實際 scale 調整
+                filtered_poses.push_back(poses[i]);
+                filtered_confidences.push_back(confidences[i]);
+            } else {
+                cout << "移除離群 marker距離偏差: " << dist << endl;
+            }
+        }
+
+        poses = filtered_poses;
+        confidences = filtered_confidences;
 
         if (!poses.empty()) {
             cv::Vec3d weighted_t(0, 0, 0);
             double total_weight = 0.0;
-            vector<Quaterniond> quats;
+            std::vector<Eigen::Quaterniond> quats;
+            Eigen::Matrix4d A = Eigen::Matrix4d::Zero();
 
             for (size_t i = 0; i < poses.size(); ++i) {
                 double w = confidences[i];
@@ -368,60 +418,44 @@ int main(int argc, char** argv) {
                     poses[i].at<double>(2, 3)
                 );
 
-                Matrix3d R;
+                Eigen::Matrix3d R;
                 for (int r = 0; r < 3; ++r)
                     for (int c = 0; c < 3; ++c)
                         R(r, c) = poses[i].at<double>(r, c);
 
-                Quaterniond q(R);
+                Eigen::Quaterniond q(R);
                 if (q.w() < 0) q.coeffs() *= -1;
-                Eigen::Quaterniond weighted_q(q.coeffs() * w);
-                quats.push_back(weighted_q);                
+
+                Eigen::Vector4d qv = q.coeffs();
+                A += w * (qv * qv.transpose());
             }
+
             if (total_weight > 0)
                 weighted_t *= (1.0 / total_weight);
             else
-                weighted_t = cv::Vec3d(0, 0, 0); // fallback
+                weighted_t = cv::Vec3d(0, 0, 0);
 
-            // 使用 Markley method 將四元數做穩定加權平均
-            Eigen::Matrix4d A = Eigen::Matrix4d::Zero();
-            for (size_t i = 0; i < quats.size(); ++i) {
-                Eigen::Vector4d qv = quats[i].coeffs(); // 順序為 (x, y, z, w)
-                A += confidences[i] * (qv * qv.transpose());  // 加權外積
-            }
-
-            // Eigen 分解找最大特徵值
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> eig(A);
-            Eigen::Vector4d q_avg_vec = eig.eigenvectors().col(3);  // 取最大特徵值對應的 eigenvector
-            Eigen::Quaterniond q_avg(q_avg_vec[3], q_avg_vec[0], q_avg_vec[1], q_avg_vec[2]); // 轉回 Quaternion (w, x, y, z)
+            Eigen::Vector4d q_avg_vec = eig.eigenvectors().col(3);
+            Eigen::Quaterniond q_avg(q_avg_vec[3], q_avg_vec[0], q_avg_vec[1], q_avg_vec[2]);
             q_avg.normalize();
-            // ➤ 加入進滑動視窗
+
             recent_positions.push_back(weighted_t);
             if (recent_positions.size() > SLIDING_WINDOW)
                 recent_positions.pop_front();
 
-            // ➤ 計算滑動平均
             cv::Vec3d smooth_t(0, 0, 0);
+            double sm_weight = 0;
             int N = recent_positions.size();
-
             for (int i = 0; i < N; ++i) {
-                double weight = (i + 1);  // 權重線性成長：1, 2, ..., N
-                total_weight += weight;
+                double weight = (i + 1);
+                sm_weight += weight;
                 smooth_t += recent_positions[i] * weight;
             }
-            smooth_t *= (1.0 / total_weight);
-
-            // ➤ 再進 Kalman 濾波
-            // cv::Vec3d filtered_t = kalman_filter.update(smooth_t);
+            smooth_t *= (1.0 / sm_weight);
 
             cv::Vec3d filtered_t = smooth_t;
-
-            
-            for (const auto& q : quats)
-                q_avg.coeffs() += q.coeffs();
-            q_avg.normalize();
-
-            Matrix3d R_avg = q_avg.toRotationMatrix();
+            Eigen::Matrix3d R_avg = q_avg.toRotationMatrix();
 
             cv::Mat T_avg = cv::Mat::eye(4, 4, CV_64F);
             for (int i = 0; i < 3; ++i)
@@ -431,7 +465,6 @@ int main(int argc, char** argv) {
             T_avg.at<double>(1, 3) = filtered_t[1];
             T_avg.at<double>(2, 3) = filtered_t[2];
 
-            // 提取相機姿態三軸方向（世界坐標中）
             cv::Vec3d x_axis(T_avg.at<double>(0, 0), T_avg.at<double>(1, 0), T_avg.at<double>(2, 0));
             cv::Vec3d y_axis(T_avg.at<double>(0, 1), T_avg.at<double>(1, 1), T_avg.at<double>(2, 1));
             cv::Vec3d z_axis(T_avg.at<double>(0, 2), T_avg.at<double>(1, 2), T_avg.at<double>(2, 2));
