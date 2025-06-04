@@ -3,18 +3,16 @@
 #include "cameraparameters.h"
 #include "websocket_client.hpp"
 #include <opencv2/highgui.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/video/tracking.hpp>
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
-#include <iostream>
-#include <fstream>
 #include <map>
-#include <ctime>
 #include <iomanip>
-
+#include <iostream>
+#include <vector>
+#include <deque>
 
 using namespace std;
 using namespace aruco;
@@ -175,7 +173,7 @@ double calculateConfidence(double reprojection_error, double angle_deg, double d
     // 設定權重與限制
     const double max_error = 4.0;      // 誤差上限
     const double max_angle = 60.0;     // 角度上限（越小越好）
-    double scale_factor = 12.0;
+    double scale_factor = 15.0;
 
     const double max_distance = markerSize*scale_factor;   // 距離上限（依場景調整）
 
@@ -234,7 +232,8 @@ int main(int argc, char** argv) {
 
     // WebSocket 初始化
     WebSocketClient ws;
-    ws.connect("ws://192.168.3.29:5000/?clientType=vr_headset&clientId=vr001");
+    ws.connect("ws://192.168.9.28:5000/?clientType=vr_headset&clientId=vr001");
+    // ws.connect("ws://192.168.9.96:5000/?clientType=vr_headset&clientId=vr001");
 
 
     MarkerDetector detector;
@@ -377,6 +376,32 @@ int main(int argc, char** argv) {
             }
         }
 
+        // 若都被丟掉，但原始 pose 只有兩個，保留角度小的那個
+        if (filtered_poses.empty() && poses.size() == 2) {
+            cout << "⚠️ 兩個候選 pose 都被視為離群，改為保留角度較小的。" << endl;
+
+            auto compute_angle_deg = [](const cv::Mat& T) {
+                cv::Vec3d cam_pos(T.at<double>(0, 3), T.at<double>(1, 3), T.at<double>(2, 3));
+                cv::Vec3d cam_z(T.at<double>(0, 2), T.at<double>(1, 2), T.at<double>(2, 2));
+                cam_z /= cv::norm(cam_z);
+                cv::Vec3d dir = -cam_pos / cv::norm(cam_pos); // 假設 marker 靠近原點
+
+                double dp = cam_z.dot(dir);
+                dp = std::max(-1.0, std::min(1.0, dp));
+                return acos(dp) * 180.0 / CV_PI;
+            };
+
+            double angle0 = compute_angle_deg(poses[0]);
+            double angle1 = compute_angle_deg(poses[1]);
+
+            int keep_index = angle0 < angle1 ? 0 : 1;
+            filtered_poses.push_back(poses[keep_index]);
+            filtered_confidences.push_back(confidences[keep_index]);
+
+            cout << "✅ 保留角度較小的 pose，角度: " << std::min(angle0, angle1) << " 度" << endl;
+        }
+
+
         poses = filtered_poses;
         confidences = filtered_confidences;
 
@@ -462,10 +487,10 @@ int main(int argc, char** argv) {
 
             std::stringstream json;
             json << std::fixed << std::setprecision(6);
-            json << R"({"type": "transform_update", "headsetId": "1", "pos": [)"
-                << filtered_t[0] << ", " << filtered_t[1] << ", " << filtered_t[2]
+            json << R"({"type": "transform_update", "headsetId": "vr001", "pos": [)"
+                << filtered_t[0] << ", " << filtered_t[2] << ", " << filtered_t[1]
                 << R"(], "orient": [)"
-                << z_axis[0] << ", " << z_axis[1] << ", " << z_axis[2] << "]}";
+                << z_axis[0] << ", " << z_axis[2] << ", " << z_axis[1] << "]}";
 
             std::string json_str = json.str();
             std::cout << "📤 Sent JSON: " << json_str << std::endl;
