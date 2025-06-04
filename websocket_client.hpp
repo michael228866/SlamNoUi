@@ -12,15 +12,19 @@ public:
     void connect(const std::string& uri);
     void send(const std::string& message);
     void close();
+    bool isConnected() const;
 
 private:
     void on_message(websocketpp::connection_hdl, ws_client::message_ptr msg);
     void on_open(websocketpp::connection_hdl hdl);
     void on_close(websocketpp::connection_hdl hdl);
     void on_fail(websocketpp::connection_hdl hdl);
+    void reconnect();  // 🔁 新增自動重連功能
 
     ws_client client;
     websocketpp::connection_hdl connection_hdl;
     bool connected;
+    std::string server_uri;  // 🔁 記錄連線 URI
+
     std::thread ws_thread;
 };
